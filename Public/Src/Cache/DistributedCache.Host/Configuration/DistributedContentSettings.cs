@@ -251,6 +251,10 @@ namespace BuildXL.Cache.Host.Configuration
 
         public IReadOnlyList<TimeSpan> RetryIntervalForCopies => RetryIntervalForCopiesMs.Select(ms => TimeSpan.FromMilliseconds(ms)).ToList();
 
+        /// <summary>
+        /// Controls the maximum total number of copy retry attempts
+        /// </summary>
+        public int MaxRetryCount { get; set; } = 32;
         #region Grpc Copier
         /// <summary>
         /// Use GRPC for file copies between CASaaS.
@@ -388,6 +392,12 @@ namespace BuildXL.Cache.Host.Configuration
         public bool Unsafe_DisableReconciliation { get; set; } = false;
 
         [DataMember]
+        public int ReconciliationCycleFrequencyMinutes { get; set; } = 30;
+
+        [DataMember]
+        public int ReconciliationMaxCycleSize { get; set; } = 100000;
+
+        [DataMember]
         public bool IsContentLocationDatabaseEnabled { get; set; } = false;
 
         [DataMember]
@@ -507,6 +517,9 @@ namespace BuildXL.Cache.Host.Configuration
 
         [DataMember]
         public int? LocationEntryExpiryMinutes { get; set; }
+
+        [DataMember]
+        public int? RestoreCheckpointAgeThresholdMinutes { get; set; }
 
         [DataMember]
         public int? MachineExpiryMinutes { get; set; }

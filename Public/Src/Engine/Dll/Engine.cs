@@ -666,6 +666,11 @@ namespace BuildXL.Engine
                 layout.FingerprintStoreDirectory = layout.EngineCacheDirectory.Combine(pathTable, Scheduler.Scheduler.FingerprintStoreDirectory);
             }
 
+            if (!layout.SharedOpaqueSidebandDirectory.IsValid)
+            {
+                layout.SharedOpaqueSidebandDirectory = layout.EngineCacheDirectory.Combine(pathTable, Scheduler.Scheduler.SharedOpaqueSidebandDirectory);
+            }
+
             // Logging
             if (string.IsNullOrEmpty(logging.LogPrefix))
             {
@@ -2253,6 +2258,7 @@ namespace BuildXL.Engine
                 { "unsafe_LazySymlinkCreation", Logger.Log.ConfigUnsafeLazySymlinkCreation },
                 { "unsafe_MonitorFileAccesses", Logger.Log.ConfigUnsafeDisabledFileAccessMonitoring },
                 { "unsafe_PreserveOutputs", Logger.Log.ConfigPreserveOutputs },
+                { "unsafe_PreserveOutputsTrustLevel", loggingContext => { } /* Special case: unsafe option we do not want logged */ },
                 { "unsafe_SourceFileCanBeInsideOutputDirectory", loggingContext => { } /* Special case: unsafe option we do not want logged */ },
                 { "unsafe_UnexpectedFileAccessesAreErrors", Logger.Log.ConfigUnsafeUnexpectedFileAccessesAsWarnings },
                 { "unsafe_IgnoreUndeclaredAccessesUnderSharedOpaques", Logger.Log.ConfigUnsafeIgnoreUndeclaredAccessesUnderSharedOpaques },

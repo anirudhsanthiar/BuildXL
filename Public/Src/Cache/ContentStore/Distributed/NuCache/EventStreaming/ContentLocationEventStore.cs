@@ -124,7 +124,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache.EventStreaming
                         EventHandler.LocationAdded(
                             context,
                             addContent.Sender,
-                            addContent.ContentHashes.Select((hash, index) => new ShortHashWithSize(hash, addContent.ContentSizes[index])).ToList(),
+                            addContent.ContentHashes.SelectList((hash, index) => new ShortHashWithSize(hash, addContent.ContentSizes[index])),
                             eventData.Reconciling);
                     }
 
@@ -165,7 +165,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache.EventStreaming
 
                     using (counters[GetAndDeserializeReconcileData].Start())
                     {
-                        addOrRemoveEvents = await GetAndDeserializeReconcileDataAsync();
+                        addOrRemoveEvents = await getAndDeserializeReconcileDataAsync();
                     }
 
                     int added = 0;
@@ -191,25 +191,23 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache.EventStreaming
                     return new ReconciliationResult(addedCount: added, removedCount: removed, totalLocalContentCount: -1);
                 }).ThrowIfFailure();
 
-            async Task<IEnumerable<ContentLocationEventData>> GetAndDeserializeReconcileDataAsync()
+            async Task<IEnumerable<ContentLocationEventData>> getAndDeserializeReconcileDataAsync()
             {
                 var reconcileFilePath = _workingDirectory / Guid.NewGuid().ToString();
                 var blobName = reconcileContent.BlobId;
 
                 await _storage.TryGetFileAsync(context, blobName, reconcileFilePath).ThrowIfFailure();
 
-                using (var stream = await _fileSystem.OpenAsync(
+                using var stream = await _fileSystem.OpenSafeAsync(
                     reconcileFilePath,
                     FileAccess.Read,
                     FileMode.Open,
                     FileShare.Read | FileShare.Delete,
                     FileOptions.DeleteOnClose,
-                    AbsFileSystemExtension.DefaultFileStreamBufferSize))
-                using (var reader = BuildXLReader.Create(stream, leaveOpen: true))
-                {
-                    // Calling ToList to force materialization of IEnumerable to avoid access of disposed stream.
-                    return EventDataSerializer.DeserializeReconcileData(reader).ToList();
-                }
+                    AbsFileSystemExtension.DefaultFileStreamBufferSize);
+                using var reader = BuildXLReader.Create(stream, leaveOpen: true);
+                // Calling ToList to force materialization of IEnumerable to avoid access of disposed stream.
+                return EventDataSerializer.DeserializeReconcileData(reader).ToList();
             }
         }
 
@@ -225,12 +223,12 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache.EventStreaming
             context = context.CreateNested();
 
             Tracer.Info(context, $"{Tracer.Name}: Sending {events.Length} event(s) to event hub.");
-            List<(ShortHash hash, EntryOperation operation, OperationReason reason, int modificationCount)> operations = events.SelectMany(
+            var operations = events.SelectMany(
                 e =>
                 {
                     var operation = GetOperation(e);
                     var reason = e.Reconciling ? OperationReason.Reconcile : OperationReason.Unknown;
-                    return e.ContentHashes.Select(hash => (hash, operation, reason, 1));
+                    return e.ContentHashes.Select(hash => (hash, operation, reason));
                 }).ToList();
             LogContentLocationOperations(context, Tracer.Name, operations);
 
@@ -257,7 +255,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache.EventStreaming
                 context.LogSendEventsOverview(counters, (int)counters[SendEvents].Duration.TotalMilliseconds);
             }
 
-            void updateCountersWith(CounterCollection<ContentLocationEventStoreCounters> localCounters, ContentLocationEventData[] sentEvents)
+            static void updateCountersWith(CounterCollection<ContentLocationEventStoreCounters> localCounters, ContentLocationEventData[] sentEvents)
             {
                 foreach (var group in sentEvents.GroupBy(t => t.Kind))
                 {
@@ -355,7 +353,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache.EventStreaming
                     try
                     {
                         using (var stream = await _fileSystem.OpenSafeAsync(reconcileFilePath, FileAccess.ReadWrite, FileMode.Create, FileShare.Read | FileShare.Delete, FileOptions.None, AbsFileSystemExtension.DefaultFileStreamBufferSize))
-                    using (var writer = BuildXLWriter.Create(stream, leaveOpen: true))
+                        using (var writer = BuildXLWriter.Create(stream, leaveOpen: true))
                         {
                             EventDataSerializer.SerializeReconcileData(context, writer, machine, addedContent, removedContent);
                         }
@@ -373,7 +371,8 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache.EventStreaming
                         _fileSystem.DeleteFile(reconcileFilePath);
                     }
                 },
-                Counters[PublishReconcile]);
+                Counters[PublishReconcile],
+                extraEndMessage: _ => $"AddedContent={addedContent.Count}, RemovedContent={removedContent.Count}, TotalContent={addedContent.Count + removedContent.Count}");
         }
 
         /// <summary>
@@ -397,7 +396,8 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache.EventStreaming
 
                     return BoolResult.Success;
                 },
-                Counters[PublishAddLocations]);
+                Counters[PublishAddLocations],
+                traceErrorsOnly: true);
         }
 
         /// <summary>
@@ -443,7 +443,8 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache.EventStreaming
                     Publish(context, new RemoveContentLocationEventData(machine, hashes) { Reconciling = reconciling });
                     return BoolResult.Success;
                 },
-                Counters[PublishRemoveLocations]);
+                Counters[PublishRemoveLocations],
+                traceErrorsOnly: true);
         }
 
         /// <summary>

@@ -76,6 +76,7 @@ namespace BuildXL.Cache.Host.Service.Internal
             ApplyIfNotNull(_distributedSettings.ReplicaCreditInMinutes, v => redisContentLocationStoreConfiguration.ContentLifetime = TimeSpan.FromMinutes(v));
             ApplyIfNotNull(_distributedSettings.MachineRisk, v => redisContentLocationStoreConfiguration.MachineRisk = v);
             ApplyIfNotNull(_distributedSettings.LocationEntryExpiryMinutes, v => redisContentLocationStoreConfiguration.LocationEntryExpiry = TimeSpan.FromMinutes(v));
+            ApplyIfNotNull(_distributedSettings.RestoreCheckpointAgeThresholdMinutes, v => redisContentLocationStoreConfiguration.Checkpoint.RestoreCheckpointAgeThreshold = TimeSpan.FromMinutes(v));
             ApplyIfNotNull(_distributedSettings.MachineExpiryMinutes, v => redisContentLocationStoreConfiguration.MachineExpiry = TimeSpan.FromMinutes(v));
 
             redisContentLocationStoreConfiguration.ReputationTrackerConfiguration.Enabled = _distributedSettings.IsMachineReputationEnabled;
@@ -166,13 +167,15 @@ namespace BuildXL.Cache.Host.Service.Internal
             if (_distributedSettings.IsPinBetterEnabled)
             {
                 pinConfiguration = new PinConfiguration();
-                if (_distributedSettings.PinRisk.HasValue) pinConfiguration.PinRisk = _distributedSettings.PinRisk.Value;
-                if (_distributedSettings.MachineRisk.HasValue) pinConfiguration.MachineRisk = _distributedSettings.MachineRisk.Value;
-                if (_distributedSettings.FileRisk.HasValue) pinConfiguration.FileRisk = _distributedSettings.FileRisk.Value;
-                if (_distributedSettings.MaxIOOperations.HasValue) pinConfiguration.MaxIOOperations = _distributedSettings.MaxIOOperations.Value;
+                if (_distributedSettings.PinRisk.HasValue) { pinConfiguration.PinRisk = _distributedSettings.PinRisk.Value; }
+                if (_distributedSettings.MachineRisk.HasValue) { pinConfiguration.MachineRisk = _distributedSettings.MachineRisk.Value; }
+                if (_distributedSettings.FileRisk.HasValue) { pinConfiguration.FileRisk = _distributedSettings.FileRisk.Value; }
+                if (_distributedSettings.MaxIOOperations.HasValue) { pinConfiguration.MaxIOOperations = _distributedSettings.MaxIOOperations.Value; }
+
                 pinConfiguration.UsePinCache = _distributedSettings.IsPinCachingEnabled;
-                if (_distributedSettings.PinCacheReplicaCreditRetentionMinutes.HasValue) pinConfiguration.PinCacheReplicaCreditRetentionMinutes = _distributedSettings.PinCacheReplicaCreditRetentionMinutes.Value;
-                if (_distributedSettings.PinCacheReplicaCreditRetentionDecay.HasValue) pinConfiguration.PinCacheReplicaCreditRetentionDecay = _distributedSettings.PinCacheReplicaCreditRetentionDecay.Value;
+
+                if (_distributedSettings.PinCacheReplicaCreditRetentionMinutes.HasValue) { pinConfiguration.PinCacheReplicaCreditRetentionMinutes = _distributedSettings.PinCacheReplicaCreditRetentionMinutes.Value; }
+                if (_distributedSettings.PinCacheReplicaCreditRetentionDecay.HasValue) { pinConfiguration.PinCacheReplicaCreditRetentionDecay = _distributedSettings.PinCacheReplicaCreditRetentionDecay.Value; }
             }
 
             var contentHashBumpTime = TimeSpan.FromMinutes(_distributedSettings.ContentHashBumpTimeMinutes);
@@ -220,6 +223,7 @@ namespace BuildXL.Cache.Host.Service.Internal
                         PinConfiguration = pinConfiguration,
                         EmptyFileHashShortcutEnabled = _distributedSettings.EmptyFileHashShortcutEnabled,
                         RetryIntervalForCopies = _distributedSettings.RetryIntervalForCopies,
+                        MaxRetryCount = _distributedSettings.MaxRetryCount,
                         TimeoutForProactiveCopies = TimeSpan.FromMinutes(_distributedSettings.TimeoutForProactiveCopiesMinutes),
                         ProactiveCopyMode = (ProactiveCopyMode)Enum.Parse(typeof(ProactiveCopyMode), _distributedSettings.ProactiveCopyMode),
                         MaxConcurrentProactiveCopyOperations = _distributedSettings.MaxConcurrentProactiveCopyOperations,
@@ -312,6 +316,9 @@ namespace BuildXL.Cache.Host.Service.Internal
 
             configuration.EnableReconciliation = !_distributedSettings.Unsafe_DisableReconciliation;
 
+            configuration.ReconciliationCycleFrequency = TimeSpan.FromMinutes(_distributedSettings.ReconciliationCycleFrequencyMinutes);
+            configuration.ReconciliationMaxCycleSize = _distributedSettings.ReconciliationMaxCycleSize;
+
             ApplyIfNotNull(_distributedSettings.UseIncrementalCheckpointing, value => configuration.Checkpoint.UseIncrementalCheckpointing = value);
             ApplyIfNotNull(_distributedSettings.IncrementalCheckpointDegreeOfParallelism, value => configuration.Checkpoint.IncrementalCheckpointDegreeOfParallelism = value);
 
@@ -331,6 +338,7 @@ namespace BuildXL.Cache.Host.Service.Internal
                 _distributedSettings.ContentLocationWriteMode,
                 value => configuration.WriteMode = (ContentLocationMode)Enum.Parse(typeof(ContentLocationMode), value));
             ApplyIfNotNull(_distributedSettings.LocationEntryExpiryMinutes, value => configuration.LocationEntryExpiry = TimeSpan.FromMinutes(value));
+            ApplyIfNotNull(_distributedSettings.RestoreCheckpointAgeThresholdMinutes, v => configuration.Checkpoint.RestoreCheckpointAgeThreshold = TimeSpan.FromMinutes(v));
 
             var errorBuilder = new StringBuilder();
             var storageCredentials = GetStorageCredentials(secrets, errorBuilder);
@@ -470,19 +478,6 @@ namespace BuildXL.Cache.Host.Service.Internal
             }
 
             return value;
-        }
-
-        private static RetryPolicy CreateSecretsRetrievalRetryPolicy(DistributedContentSettings settings)
-        {
-            return new RetryPolicy(
-                new KeyVaultRetryPolicy(),
-                new ExponentialBackoff(
-                    name: "SecretsRetrievalBackoff",
-                    retryCount: settings.SecretsRetrievalRetryCount,
-                    minBackoff: TimeSpan.FromSeconds(settings.SecretsRetrievalMinBackoffSeconds),
-                    maxBackoff: TimeSpan.FromSeconds(settings.SecretsRetrievalMaxBackoffSeconds),
-                    deltaBackoff: TimeSpan.FromSeconds(settings.SecretsRetrievalDeltaBackoffSeconds),
-                    firstFastRetry: false)); // All retries are subjects to the policy, even the first one
         }
 
         private sealed class KeyVaultRetryPolicy : ITransientErrorDetectionStrategy

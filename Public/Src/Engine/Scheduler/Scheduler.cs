@@ -150,6 +150,11 @@ namespace BuildXL.Scheduler
         /// </summary>
         public const string FingerprintStoreDirectory = "FingerprintStore";
 
+        /// <summary>
+        /// <see cref="ILayoutConfiguration.SharedOpaqueSidebandDirectory"/> directory name.
+        /// </summary>
+        public const string SharedOpaqueSidebandDirectory = "SharedOpaqueSidebandState";
+
         #endregion Constants
 
         #region State
@@ -1183,6 +1188,9 @@ namespace BuildXL.Scheduler
                     m_runnablePipPerformance,
                     m_testHooks?.FingerprintStoreTestHooks);
 
+            // create the directory where shared opaque outputs journals will be stored
+            FileUtilities.CreateDirectoryWithRetry(configuration.Layout.SharedOpaqueSidebandDirectory.ToString(Context.PathTable));
+
             MasterSpecificExecutionLogTarget masterTarget = null;
 
             if (!IsDistributedWorker)
@@ -2150,16 +2158,12 @@ namespace BuildXL.Scheduler
             }
 
 #if PLATFORM_OSX
-
             Memory.PressureLevel pressureLevel = Memory.PressureLevel.Normal;
             var result = Memory.GetMemoryPressureLevel(ref pressureLevel) == Dispatch.MACOS_INTEROP_SUCCESS;
-            bool isMemoryPressureCritical = result && (pressureLevel > Memory.PressureLevel.Warning);
-
-            if (!resourceAvailable || isMemoryPressureCritical)
-#else
-            if (!resourceAvailable)
+            resourceAvailable &= !(result && (pressureLevel > m_configuration.Schedule.MaximumAllowedMemoryPressureLevel));
 #endif
 
+            if (!resourceAvailable)
             {
                 if (LocalWorker.ResourcesAvailable)
                 {
@@ -4226,7 +4230,7 @@ namespace BuildXL.Scheduler
         public DirectoryTranslator DirectoryTranslator { get; }
 
         /// <summary>
-        /// Gets the execution information for the producer pip of the given file. 
+        /// Gets the execution information for the producer pip of the given file.
         /// </summary>
         public string GetProducerInfoForFailedMaterializeFile(in FileArtifact artifact)
         {
@@ -4246,8 +4250,8 @@ namespace BuildXL.Scheduler
                 PipExecutionCounters.IncrementCounter(PipExecutorCounter.NumFilesFailedToMaterializeDueToEarlyWorkerRelease);
             }
 
-            string whenWorkerReleased = isWorkerReleasedEarly ? 
-                $"UTC {worker.WorkerEarlyReleasedTime.Value.ToLongTimeString()} ({(DateTime.UtcNow - worker.WorkerEarlyReleasedTime.Value).TotalMinutes.ToString("0.0")} minutes ago)" : 
+            string whenWorkerReleased = isWorkerReleasedEarly ?
+                $"UTC {worker.WorkerEarlyReleasedTime.Value.ToLongTimeString()} ({(DateTime.UtcNow - worker.WorkerEarlyReleasedTime.Value).TotalMinutes.ToString("0.0")} minutes ago)" :
                 "N/A";
 
             return $"{producer.FormattedSemiStableHash} {step} on Worker#{workerId} ({m_workers[(int)workerId].Status} - WhenReleased: {whenWorkerReleased})";
@@ -5621,7 +5625,7 @@ namespace BuildXL.Scheduler
                 return false;
             }
 
-            return PipGraph.IsPreservedOutputArtifact(artifact);
+            return PipGraph.IsPreservedOutputArtifact(artifact, m_configuration.Sandbox.UnsafeSandboxConfiguration.PreserveOutputsTrustLevel);
         }
 
         [SuppressMessage("Microsoft.Design", "CA1033:InterfaceMethodsShouldBeCallableByChildTypes")]

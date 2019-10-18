@@ -37,9 +37,10 @@ namespace BuildXL.Processes
                 // but later was made a shared opaque output without a content change.
                 // Make sure we allow for attribute writing first
                 var writeAttributesDenied = !FileUtilities.HasWritableAttributeAccessControl(expandedPath);
+                var writeAttrs = FileSystemRights.WriteAttributes | FileSystemRights.WriteExtendedAttributes;
                 if (writeAttributesDenied)
                 {
-                    FileUtilities.SetFileAccessControl(expandedPath, FileSystemRights.WriteAttributes | FileSystemRights.WriteExtendedAttributes, allow: true);
+                    FileUtilities.SetFileAccessControl(expandedPath, writeAttrs, allow: true);
                 }
 
                 try
@@ -63,7 +64,7 @@ namespace BuildXL.Processes
                     // Restore the attributes as they were originally set
                     if (writeAttributesDenied)
                     {
-                        FileUtilities.SetFileAccessControl(expandedPath, FileSystemRights.WriteAttributes | FileSystemRights.WriteExtendedAttributes, allow: false);
+                        FileUtilities.SetFileAccessControl(expandedPath, writeAttrs, allow: false);
                     }
                 }
             }
@@ -90,16 +91,16 @@ namespace BuildXL.Processes
 
         private static unsafe class Unix
         {
-            private const string MY_XATTR_NAME = "com.microsoft.buildxl:shared_opaque_output";
+            private const string BXL_SHARED_OPAQUE_XATTR_NAME = "com.microsoft.buildxl:shared_opaque_output";
 
             // arbitrary value; in the future, we could store something more useful here (e.g., the producer PipId or something)
-            private const long MY_XATTR_VALUE = 42; 
+            private const long BXL_SHARED_OPAQUE_XATTR_VALUE = 42;
 
             // from xattr.h:
             // #define XATTR_NOFOLLOW   0x0001     /* Don't follow symbolic links */
             private const int XATTR_NOFOLLOW = 1;
 
-            [DllImport("libc", EntryPoint = "setxattr")]
+            [DllImport("libc", EntryPoint = "setxattr", SetLastError = true)]
             private static extern int SetXattr(
                 [MarshalAs(UnmanagedType.LPStr)] string path,
                 [MarshalAs(UnmanagedType.LPStr)] string name,
@@ -108,7 +109,7 @@ namespace BuildXL.Processes
                 uint position,
                 int options);
 
-            [DllImport("libc", EntryPoint = "getxattr")]
+            [DllImport("libc", EntryPoint = "getxattr", SetLastError = true)]
             private static extern long GetXattr(
                 [MarshalAs(UnmanagedType.LPStr)] string path,
                 [MarshalAs(UnmanagedType.LPStr)] string name,
@@ -117,30 +118,65 @@ namespace BuildXL.Processes
                 uint position,
                 int options);
 
+            private const Interop.MacOS.IO.FilePermissions S_IWUSR = Interop.MacOS.IO.FilePermissions.S_IWUSR;
+
             /// <summary>
             /// Flags the given path as being an output under a shared opaque by setting
-            /// <see cref="MY_XATTR_NAME"/> xattr to a <see cref="MY_XATTR_VALUE"/>.
+            /// <see cref="BXL_SHARED_OPAQUE_XATTR_NAME"/> xattr to a <see cref="BXL_SHARED_OPAQUE_XATTR_VALUE"/>.
             /// </summary>
             public static void SetPathAsSharedOpaqueOutput(string expandedPath)
             {
-                long value = MY_XATTR_VALUE;
-                var err = SetXattr(expandedPath, MY_XATTR_NAME, &value, sizeof(long), 0, XATTR_NOFOLLOW);
-                if (err != 0)
+                bool followSymlink = false;
+                var currentMode = (Interop.MacOS.IO.FilePermissions)Interop.MacOS.IO.GetFilePermissionsForFilePath(expandedPath, followSymlink);
+                bool isWritableByUser = (currentMode & S_IWUSR) != 0;
+
+                // set u+w if not already set
+                if (!isWritableByUser)
                 {
-                    throw new BuildXLException(I($"Failed to set '{MY_XATTR_NAME}' extended attribute. Error: {err}"));
+                    Interop.MacOS.IO.SetFilePermissionsForFilePath(expandedPath, currentMode | S_IWUSR, followSymlink);
+                }
+
+                // set xattr
+                long value = BXL_SHARED_OPAQUE_XATTR_VALUE;
+                var err = SetXattr(expandedPath, BXL_SHARED_OPAQUE_XATTR_NAME, &value, sizeof(long), 0, XATTR_NOFOLLOW);
+                var xattrErrorCode = err != 0 ? Marshal.GetLastWin32Error() : 0;
+
+                // reset permissions if we changed them
+                if (!isWritableByUser)
+                {
+                    Interop.MacOS.IO.SetFilePermissionsForFilePath(expandedPath, currentMode, followSymlink);
+                }
+
+                // throw if neither SetXattr succeeded nor the path is properly marked
+                if (xattrErrorCode != 0 && !IsSharedOpaqueOutputWithFallback(expandedPath, checkFallback: false))
+                {
+                    throw new BuildXLException(I($"Failed to set '{BXL_SHARED_OPAQUE_XATTR_NAME}' extended attribute for file '{expandedPath}'. Error: {xattrErrorCode}."));
                 }
             }
 
             /// <summary>
             /// Checks if the given path is an output under a shared opaque by checking if
-            /// it contains extended attribute by <see cref="MY_XATTR_NAME"/> name.
+            /// it contains extended attribute by <see cref="BXL_SHARED_OPAQUE_XATTR_NAME"/> name.
             /// </summary>
-            public static bool IsSharedOpaqueOutput(string expandedPath)
+            public static bool IsSharedOpaqueOutput(string expandedPath) => IsSharedOpaqueOutputWithFallback(expandedPath, checkFallback: true);
+
+            // TODO: delete the fallback logic after a successful transition from old to new logic
+            private static bool IsSharedOpaqueOutputWithFallback(string expandedPath, bool checkFallback)
             {
                 long value = 0;
                 uint valueSize = sizeof(long);
-                var resultSize = GetXattr(expandedPath, MY_XATTR_NAME, &value, valueSize, 0, XATTR_NOFOLLOW);
-                return resultSize == valueSize && value == MY_XATTR_VALUE;
+                var resultSize = GetXattr(expandedPath, BXL_SHARED_OPAQUE_XATTR_NAME, &value, valueSize, 0, XATTR_NOFOLLOW);
+                if (resultSize == valueSize && value == BXL_SHARED_OPAQUE_XATTR_VALUE)
+                {
+                    return true;
+                }
+
+                if (checkFallback && FileUtilities.GetFileTimestamps(expandedPath).CreationTime == WellKnownTimestamps.OutputInSharedOpaqueTimestamp)
+                {
+                    return true;
+                }
+
+                return false;
             }
         }
 

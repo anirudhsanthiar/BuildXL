@@ -47,7 +47,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
         private readonly Func<IReadOnlyList<MachineId>> _getInactiveMachines;
 
         private Timer _gcTimer;
-        private NagleQueue<(ShortHash hash, EntryOperation op, OperationReason reason, int modificationCount)> _nagleOperationTracer;
+        private NagleQueue<(ShortHash hash, EntryOperation op, OperationReason reason)> _nagleOperationTracer;
         private readonly ContentLocationDatabaseConfiguration _configuration;
 
         /// <nodoc />
@@ -223,7 +223,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
                     Timeout.InfiniteTimeSpan);
             }
 
-            _nagleOperationTracer = NagleQueue<(ShortHash, EntryOperation, OperationReason, int)>.Create(
+            _nagleOperationTracer = NagleQueue<(ShortHash, EntryOperation, OperationReason)>.Create(
                 ops =>
                 {
                     LogContentLocationOperations(context, Tracer.Name, ops);
@@ -291,7 +291,14 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
         /// <summary>
         /// Enumeration filter used by <see cref="ContentLocationDatabase.EnumerateEntriesWithSortedKeys"/> to filter out entries by raw value from a database.
         /// </summary>
-        public delegate bool EnumerationFilter(byte[] value);
+        public class EnumerationFilter
+        {
+            /// <nodoc />
+            public Func<byte[], bool> ShouldEnumerate { get; set; }
+
+            /// <nodoc />
+            public ShortHash? StartingPoint { get; set; }
+        }
 
         /// <nodoc />
         protected abstract IEnumerable<(ShortHash key, ContentLocationEntry entry)> EnumerateEntriesWithSortedKeysFromStorage(
@@ -372,68 +379,87 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
                 counter: Counters[ContentLocationDatabaseCounters.GarbageCollectContent]);
         }
 
-        /// <nodoc />
+        // Iterate over all content in DB, for each hash removing locations known to
+        // be inactive, and removing hashes with no locations.
         private BoolResult GarbageCollectContentCore(OperationContext context)
         {
+            // Counters for work done.
             int removedEntries = 0;
             int totalEntries = 0;
-
             long uniqueContentSize = 0;
             long totalContentCount = 0;
             long totalContentSize = 0;
             int uniqueContentCount = 0;
 
-            // Tracking the difference between sequence of hashes for diagnostic purposes. We need to know how good short hashes are and how close are we to collisions.
+            // Tracking the difference between sequence of hashes for diagnostic purposes. We need to know how good short hashes are and how close are we to collisions. 
+            ShortHash? lastHash = null;
             int maxHashFirstByteDifference = 0;
 
-            ShortHash? lastHash = null;
-
+            // Enumerate over all hashes...
             foreach (var hash in EnumerateSortedKeys(context))
             {
+                if (context.Token.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                if (!TryGetEntryCore(context, hash, out var entry))
+                {
+                    continue;
+                }
+
+                // Update counters.
+                int replicaCount = entry.Locations.Count;
+                uniqueContentCount++;
+                uniqueContentSize += entry.ContentSize;
+                totalContentSize += entry.ContentSize * replicaCount;
+                totalContentCount += replicaCount;
+
+                // Filter out inactive machines.
+                var filteredEntry = FilterInactiveMachines(entry);
+
+                // Decide if we ought to modify the entry.
+                if (filteredEntry.Locations.Count == 0 || filteredEntry.Locations.Count != entry.Locations.Count)
+                {
+                    // Use double-checked locking to usually avoid locking, but still
+                    // be safe in case we are in a race to update content location data.
+                    lock (GetLock(hash))
+                    {
+                        if (!TryGetEntryCore(context, hash, out entry))
+                        {
+                            continue;
+                        }
+                        filteredEntry = FilterInactiveMachines(entry);
+
+                        if (filteredEntry.Locations.Count == 0)
+                        {
+                            // If there are no good locations, remove the entry.
+                            removedEntries++;
+                            Counters[ContentLocationDatabaseCounters.TotalNumberOfCollectedEntries].Increment();
+                            Delete(context, hash);
+                            LogEntryDeletion(hash, OperationReason.GarbageCollect);
+                        }
+                        else if(filteredEntry.Locations.Count != entry.Locations.Count)
+                        {
+                            // If there are some bad locations, remove them.
+                            Counters[ContentLocationDatabaseCounters.TotalNumberOfCleanedEntries].Increment();
+                            Store(context, hash, filteredEntry);
+                            _nagleOperationTracer.Enqueue((hash, EntryOperation.RemoveMachine, OperationReason.GarbageCollect));
+                        }
+                    }
+                }
+
                 totalEntries++;
 
+                // Some logic to try to measure how "close" short hashes get.
+                // dawright: I don't think this works, because hashes could be very close (e.g. all same in low-order bits)
+                // and yet still be very far away when ordered (e.g. high-order bits differ), and we only compare
+                // neighbors in ordered list. But I'm leaving it for now because it's orthogonal to my current change.
                 if (lastHash != null && lastHash != hash)
                 {
                     maxHashFirstByteDifference = Math.Max(maxHashFirstByteDifference, GetFirstByteDifference(lastHash.Value, hash));
                 }
-
                 lastHash = hash;
-
-                lock (GetLock(hash))
-                {
-                    if (context.Token.IsCancellationRequested)
-                    {
-                        break;
-                    }
-
-                    if (!TryGetEntryCore(context, hash, out var entry))
-                    {
-                        continue;
-                    }
-
-                    var replicaCount = entry.Locations.Count;
-
-                    uniqueContentCount++;
-                    uniqueContentSize += entry.ContentSize;
-                    totalContentSize += entry.ContentSize * replicaCount;
-                    totalContentCount += replicaCount;
-
-                    var filteredEntry = FilterInactiveMachines(entry);
-                    if (filteredEntry.Locations.Count == 0)
-                    {
-                        removedEntries++;
-                        Counters[ContentLocationDatabaseCounters.TotalNumberOfCollectedEntries].Increment();
-                        Delete(context, hash);
-                        LogEntryDeletion(context, hash, entry, OperationReason.GarbageCollect, replicaCount);
-                    }
-                    else if (filteredEntry.Locations.Count != entry.Locations.Count)
-                    {
-                        Counters[ContentLocationDatabaseCounters.TotalNumberOfCleanedEntries].Increment();
-                        Store(context, hash, entry);
-
-                        _nagleOperationTracer.Enqueue((hash, EntryOperation.RemoveMachine, OperationReason.GarbageCollect, entry.Locations.Count - filteredEntry.Locations.Count));
-                    }
-                }
             }
 
             Counters[ContentLocationDatabaseCounters.TotalNumberOfScannedEntries].Add(uniqueContentCount);
@@ -676,11 +702,11 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
 
                     if (existsOnMachine)
                     {
-                        _nagleOperationTracer.Enqueue((hash, initialEntry.Locations.Count == entry.Locations.Count ? EntryOperation.Touch : EntryOperation.AddMachine, reason, 1));
+                        _nagleOperationTracer.Enqueue((hash, initialEntry.Locations.Count == entry.Locations.Count ? EntryOperation.Touch : EntryOperation.AddMachine, reason));
                     }
                     else
                     {
-                        _nagleOperationTracer.Enqueue((hash, EntryOperation.RemoveMachine, reason, 1));
+                        _nagleOperationTracer.Enqueue((hash, machine == null ? EntryOperation.Touch : EntryOperation.RemoveMachine, reason));
                     }
                 }
                 else
@@ -703,7 +729,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
                     // Remove the hash when no more locations are registered
                     Delete(context, hash);
                     Counters[ContentLocationDatabaseCounters.TotalNumberOfDeletedEntries].Increment();
-                    LogEntryDeletion(context, hash, entry, reason, priorLocationCount);
+                    LogEntryDeletion(hash, reason);
                 }
                 else
                 {
@@ -712,7 +738,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
                     if (created)
                     {
                         Counters[ContentLocationDatabaseCounters.TotalNumberOfCreatedEntries].Increment();
-                        _nagleOperationTracer.Enqueue((hash, EntryOperation.Create, reason, 1));
+                        _nagleOperationTracer.Enqueue((hash, EntryOperation.Create, reason));
                     }
                 }
 
@@ -720,10 +746,9 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
             }
         }
 
-        private void LogEntryDeletion(OperationContext context, ShortHash hash, ContentLocationEntry entry, OperationReason reason, int priorLocationCount)
+        private void LogEntryDeletion(ShortHash hash, OperationReason reason)
         {
-            _nagleOperationTracer.Enqueue((hash, EntryOperation.Delete, reason, priorLocationCount));
-            context.TraceDebug($"Deleted entry for hash {hash}. Creation Time: '{entry.CreationTimeUtc}', Last Access Time: '{entry.LastAccessTimeUtc}'");
+            _nagleOperationTracer.Enqueue((hash, EntryOperation.Delete, reason));
         }
 
         /// <summary>
@@ -809,12 +834,10 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
         /// </remarks>
         protected byte[] SerializeCore<T>(T instance, Action<T, BuildXLWriter> serializeFunc)
         {
-            using (var pooledWriter = _writerPool.GetInstance())
-            {
-                var writer = pooledWriter.Instance.Writer;
-                serializeFunc(instance, writer);
-                return pooledWriter.Instance.Buffer.ToArray();
-            }
+            using var pooledWriter = _writerPool.GetInstance();
+            var writer = pooledWriter.Instance.Writer;
+            serializeFunc(instance, writer);
+            return pooledWriter.Instance.Buffer.ToArray();
         }
 
         /// <summary>
@@ -825,11 +848,9 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
         /// </remarks>
         protected T DeserializeCore<T>(byte[] bytes, Func<BuildXLReader, T> deserializeFunc)
         {
-            using (PooledObjectWrapper<StreamBinaryReader> pooledReader = _readerPool.GetInstance())
-            {
-                var reader = pooledReader.Instance;
-                return reader.Deserialize(new ArraySegment<byte>(bytes), deserializeFunc);
-            }
+            using PooledObjectWrapper<StreamBinaryReader> pooledReader = _readerPool.GetInstance();
+            var reader = pooledReader.Instance;
+            return reader.Deserialize(new ArraySegment<byte>(bytes), deserializeFunc);
         }
 
         /// <summary>
@@ -857,21 +878,19 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
         /// </remarks>
         public bool HasMachineId(byte[] bytes, int machineId)
         {
-            using (var pooledObjectWrapper = _readerPool.GetInstance())
-            {
-                var pooledReader = pooledObjectWrapper.Instance;
-                return pooledReader.Deserialize(
-                    new ArraySegment<byte>(bytes),
-                    machineId,
-                    (localIndex, reader) =>
-                    {
-                        // It is very important for this lambda to be non-capturing, because it will be called
-                        // many times.
-                        // Avoiding allocations here severely affect performance during reconciliation.
-                        _ = reader.ReadInt64Compact();
-                        return MachineIdSet.HasMachineId(reader, localIndex);
-                    });
-            }
+            using var pooledObjectWrapper = _readerPool.GetInstance();
+            var pooledReader = pooledObjectWrapper.Instance;
+            return pooledReader.Deserialize(
+                new ArraySegment<byte>(bytes),
+                machineId,
+                (localIndex, reader) =>
+                {
+                    // It is very important for this lambda to be non-capturing, because it will be called
+                    // many times.
+                    // Avoiding allocations here severely affect performance during reconciliation.
+                    _ = reader.ReadInt64Compact();
+                    return MachineIdSet.HasMachineId(reader, localIndex);
+                });
         }
     }
 }

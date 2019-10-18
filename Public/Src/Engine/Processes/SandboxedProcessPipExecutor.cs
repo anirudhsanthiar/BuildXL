@@ -292,7 +292,8 @@ namespace BuildXL.Processes
             m_semanticPathExpander = semanticPathExpander;
             m_logger = logger ?? new SandboxedProcessLogger(m_loggingContext, pip, context);
             m_disableConHostSharing = disableConHostSharing;
-            m_shouldPreserveOutputs = m_pip.AllowPreserveOutputs && m_sandboxConfig.UnsafeSandboxConfiguration.PreserveOutputs != PreserveOutputsMode.Disabled;
+            m_shouldPreserveOutputs = m_pip.AllowPreserveOutputs && m_sandboxConfig.UnsafeSandboxConfiguration.PreserveOutputs != PreserveOutputsMode.Disabled
+                                      && m_sandboxConfig.UnsafeSandboxConfiguration.PreserveOutputsTrustLevel <= m_pip.PreserveOutputsTrustLevel;
             m_processIdListener = processIdListener;
             m_pipEnvironment = pipEnvironment;
             m_pipDataRenderer = pipDataRenderer ?? new PipFragmentRenderer(m_pathTable);
@@ -366,7 +367,7 @@ namespace BuildXL.Processes
         {
             FileArtifact fileArtifact = file.PipFileArtifact(m_pip);
 
-            string filename = null;
+            string filename;
             if (fileArtifact.IsValid)
             {
                 // If the file is valid, that means it also got included as a declared output file
@@ -747,6 +748,7 @@ namespace BuildXL.Processes
                     return SandboxedProcessPipExecutionResult.PreparationFailure();
                 }
 
+                using (var sharedOpaqueOutputLogger = CreateSharedOpaqueOutputLoggerIfConfigured())
                 using (var allInputPathsUnderSharedOpaquesWrapper = Pools.GetAbsolutePathSet())
                 {
                     // Here we collect all the paths representing inputs under shared opaques dependencies
@@ -776,7 +778,7 @@ namespace BuildXL.Processes
                     string arguments = m_pip.Arguments.ToString(m_pipDataRenderer);
                     m_timeout = GetEffectiveTimeout(m_pip.Timeout, m_sandboxConfig.DefaultTimeout, m_sandboxConfig.TimeoutMultiplier);
 
-                    SandboxedProcessInfo info = new SandboxedProcessInfo(
+                    var info = new SandboxedProcessInfo(
                         m_pathTable,
                         this,
                         executable,
@@ -785,7 +787,8 @@ namespace BuildXL.Processes
                         m_containerConfiguration,
                         m_pip.TestRetries,
                         m_loggingContext,
-                        sandboxConnection: sandboxConnection)
+                        sandboxConnection: sandboxConnection,
+                        sharedOpaqueOutputLogger: sharedOpaqueOutputLogger)
                     {
                         Arguments = arguments,
                         WorkingDirectory = m_workingDirectory,
@@ -812,6 +815,15 @@ namespace BuildXL.Processes
 
                 m_fileAccessManifest.UnsetMessageCountSemaphore();
             }
+        }
+
+        private SharedOpaqueOutputLogger CreateSharedOpaqueOutputLoggerIfConfigured()
+        {
+            // don't use this logger if the root directory is not set up in the configuration layout or
+            // if pip's semistable hash is 0 (happens only in tests where multiple pips can have this hash)
+            return m_layoutConfiguration?.SharedOpaqueSidebandDirectory.IsValid == true && m_pip.SemiStableHash != 0
+                ? new SharedOpaqueOutputLogger(m_context, m_pip, m_layoutConfiguration.SharedOpaqueSidebandDirectory)
+                : null;
         }
 
         private bool SandboxedProcessNeedsExecuteExternal
@@ -2497,7 +2509,6 @@ namespace BuildXL.Processes
                             if (ShouldPreserveDeclaredOutput(output.Path, preserveOutputWhitelist))
                             {
                                 Contract.Assume(m_makeOutputPrivate != null);
-
                                 // A process may be configured to allow its prior outputs to be seen by future
                                 // invocations. In this case we must make sure the outputs are no longer hardlinked to
                                 // the cache to allow them to be writeable.
@@ -2964,8 +2975,6 @@ namespace BuildXL.Processes
             return false;
         }
 
-        private Dictionary<AbsolutePath, bool> m_isDirSymlinkCache = new Dictionary<AbsolutePath, bool>();
-
         /// <summary>
         /// Returns true if any symlinks are found on a given path
         /// </summary>
@@ -2984,6 +2993,8 @@ namespace BuildXL.Processes
 
             return PathContainsSymlinksCached(path.GetParent(m_context.PathTable));
         }
+
+        private readonly Dictionary<AbsolutePath, bool> m_isDirSymlinkCache = new Dictionary<AbsolutePath, bool>();
 
         /// <summary>
         /// Same as <see cref="PathContainsSymlinks"/> but with caching around it.
@@ -4104,8 +4115,8 @@ namespace BuildXL.Processes
             var unexpectedSurvivingChildProcesses = result
                 .SurvivingChildProcesses
                 .Where(pr =>
-                    !HasProcessName(pr, "ProcessTreeContextCreator.exe") &&
-                    !m_pip.AllowedSurvivingChildProcessNames.Any(procName => HasProcessName(pr, procName.ToString(m_context.StringTable))));
+                    !hasProcessName(pr, "ProcessTreeContextCreator.exe") &&
+                    !m_pip.AllowedSurvivingChildProcessNames.Any(procName => hasProcessName(pr, procName.ToString(m_context.StringTable))));
 
             int numErrors = unexpectedSurvivingChildProcesses.Count();
 
@@ -4136,7 +4147,7 @@ namespace BuildXL.Processes
 
             return numErrors;
 
-            bool HasProcessName(ReportedProcess pr, string name)
+            static bool hasProcessName(ReportedProcess pr, string name)
             {
                 return string.Equals(Path.GetFileName(pr.Path), name, StringComparison.OrdinalIgnoreCase);
             }
